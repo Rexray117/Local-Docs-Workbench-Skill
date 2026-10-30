@@ -7,7 +7,7 @@ description: >-
   触发词：搭建工作台、生成单文件HTML工作台、本地资料索引页、把md转成工作台、
   抽取文档生成看板、workbench from local docs。
 agent_created: true
-version: 1.0.0
+version: 1.1.0
 ---
 
 # 从本地文档构建单文件工作台
@@ -46,9 +46,12 @@ diff <(ls -1 A/) <(ls -1 B/)
 - `clip()` 里统一清洗源文档中的 emoji 与行首符号（源文档常带 `🌱` `🚀` 类装饰符）。
 - docx 只读提取用标准库即可，无需 python-docx：
   ```python
+  import html, re, zipfile
   with zipfile.ZipFile(p) as z:
       xml = z.read("word/document.xml").decode("utf-8", "ignore")
-  txt = re.sub(r"<[^>]+>", "", xml.replace("</w:p>", "\n"))
+  xml = xml.replace("</w:tc>", " | ").replace("</w:p>", "\n")   # 单元格→竖线，否则整表粘连
+  txt = html.unescape(re.sub(r"<[^>]+>", "", xml))               # 必须反转义，否则 &amp; 原样进 payload
+  txt = "\n".join(line.strip(" |") for line in txt.splitlines() if line.strip(" |"))
   ```
 - **必须加"自检报告"**：解析条数 + 来源 + 是否达标，写进产物。这是发现解析失灵的唯一手段。
 
@@ -72,6 +75,12 @@ render.py 末尾做**静态自检**并 raise：占位符已替换、无 http(s) 
 **第一层：Node DOM 桩，跑真实脚本（抓逻辑错误）**
 
 ```javascript
+const vm = require("node:vm");
+const els = {};                                   // code 里 `els[id] ||= …` 依赖它，漏了直接 ReferenceError
+const mkEl = () => ({ innerHTML:"", textContent:"", value:"", style:{}, dataset:{},
+                      classList:{ add(){}, remove(){}, toggle(){}, contains(){ return false; } },
+                      appendChild(){}, addEventListener(){}, querySelector(){ return null; },
+                      querySelectorAll(){ return []; } });
 const ctx = {
   document: { getElementById(id){ return els[id] ||= {innerHTML:"",textContent:"",style:{},
                 scrollIntoView(){},value:""}; },
@@ -97,7 +106,8 @@ ctx.__ready();                                                // 触发初始化
 **第二层：无头 Chrome，真实渲染（抓视觉与布局问题）**
 
 ```bash
-CHROME="C:/Users/ASUS/AppData/Local/ms-playwright/chromium-1208/chrome-win64/chrome.exe"
+CHROME=$(ls -d "$LOCALAPPDATA/ms-playwright"/chromium-*/chrome-win64/chrome.exe 2>/dev/null | sort -V | tail -1)
+[ -x "$CHROME" ] || CHROME="/c/Program Files/Google/Chrome/Application/chrome.exe"   # 回退系统 Chrome
 "$CHROME" --headless=new --disable-gpu --no-sandbox --virtual-time-budget=4000 \
   --dump-dom "file:///D:/path/_preview.html" > _dom.html      # 执行JS后转储DOM
 "$CHROME" --headless=new --disable-gpu --no-sandbox --hide-scrollbars \
@@ -105,12 +115,37 @@ CHROME="C:/Users/ASUS/AppData/Local/ms-playwright/chromium-1208/chrome-win64/chr
   --screenshot="D:/abs/path/shot.png" "file:///D:/path/_preview.html"
 ```
 
-- 中文路径要先 `cp` 成 ASCII 文件名（如 `_preview.html`），否则 file:// 易失败。
+- `file://` 可直接打开中文路径（实测可用）；真正会静默失败的是 `--screenshot` 给的相对路径，
+  以及 `--user-data-dir` 指向含空格的临时目录。仍做成 ASCII 副本只是为了 `--dump-dom` 重定向好写。
 - `--screenshot` **必须给绝对路径**，相对路径不写文件。
 - 要单独看某张卡：用 Python 在副本上把 `renderXxx()` 的拼接改成只调那一张，
   再注入 `#todo,.cps,.tabs{display:none}` 置顶显示。
 - 要验证非默认 Tab：在副本上把默认值 `s.tab || "anchor"` 改成目标 Tab。
 - 验证完**删掉所有临时副本与截图**。
+
+## 可运行基线（`assets/`，别从零手写）
+
+本技能自带一套跑通过的骨架，四段式里 ②③④ 直接复用，只改 `extract_xxx()` 与 payload 里的 `sections`：
+
+| 文件 | 作用 |
+| --- | --- |
+| `assets/build.py` | 常量 + `read/write/clip/cjk_count/docx_text` + `md_tables` + 抽取器范例 + `main()` 落盘 `payload.json`、`data/*.md`、强制写 `SELFTEST.md` |
+| `assets/template.html` | 通用单文件壳：`#meta-source`/`#meta-built`/`#search`/`#tabs`/`#panels` 锚点齐全，样式脚本全内联，占位符 `const PAYLOAD = /*__PAYLOAD__*/null;` |
+| `assets/render.py` | 注入 + 静态自检（占位符/外链/CDN/emoji/锚点/内联），不通过直接非零退出 |
+| `assets/validate.js` | Node DOM 桩，`vm`/`els`/`mkEl` 已定义，跑真实脚本并断言每个面板 `innerHTML.length > 20`、空数据集不崩 |
+
+最短闭环（复制到工作目录、改掉常量与 `extract_*` 即可）：
+
+```bash
+cp -r <skill>/assets ./wb && cd wb
+python build.py                   # → out/payload.json + out/data/*.md + out/data/SELFTEST.md
+python render.py                  # → _preview.html
+node validate.js _preview.html    # DOM 桩断言，全绿再进无头 Chrome 截图
+```
+
+约定：`payload` 顶层是 `meta` + `sections[]`（每项 `{id, title, rows[]}`），
+`build.py` 只负责把本地文档抽成这个形状，`template.html` 与 `render.py` 不必改。
+`SKILL.md` 里引用的脚本一律写成 `assets/xxx`，保证从 skills 根目录直接可跑。
 
 ## 七个必踩的坑
 
@@ -141,9 +176,6 @@ CHROME="C:/Users/ASUS/AppData/Local/ms-playwright/chromium-1208/chrome-win64/chr
    `height` 对 `display:inline` 无效，`<i style="height:100%">` 于是塌成 0——条形图整体不可见。
    在 CSS 里写 `.bar{display:block;width:100%;height:8px}`，别只依赖父级 flex 布局碰运气。
    **这类问题 Node DOM 桩测不出来，只能靠截图发现**。
-
-## 数据模型建议
-
 
 ## 数据模型建议
 
